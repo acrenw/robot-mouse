@@ -1,0 +1,14 @@
+# python
+__pycache__/
+
+# virtual environment
+venv/
+
+# model weights (large files, regenerate with train_sac.py)
+# *.pt # uncomment if want to train on pi
+
+# ide
+.vscode/
+
+# videos
+data/videos/

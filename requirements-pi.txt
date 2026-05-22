@@ -1,0 +1,6 @@
+torch
+torchvision
+numpy
+ultralytics
+opencv-python-headless
+RPi.GPIO
