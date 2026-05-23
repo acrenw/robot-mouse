@@ -105,6 +105,7 @@ def main():
 
     print(f"[run] starting loop at {args.fps} hz\n")
     try:
+        sensor_buf = []
         while True:
             t0 = time.time()
 
@@ -148,6 +149,10 @@ def main():
 
             # read front distance sensor
             sensor_front = read_front_m()
+            sensor_buf.append(sensor_front)
+            sensor_buf = sensor_buf[-3:]
+            sensor_front = min(sensor_buf)
+            print(f"  [sensor] {sensor_front:.2f}m")
 
             obs = build_obs(cat_state, mouse_speed, sensor_front)
 
