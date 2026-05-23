@@ -23,10 +23,10 @@ MAX_OMEGA = 2.0 # rad/s
 STOP_DIST = 0.15 # metres, safety layer hard stop
 WHEELBASE = 0.10 # metres, distance between wheels (measure and update this)
 
-# cap pwm so TT motors don't get more than 6V from a 7.4V lipo
-MOTOR_BATTERY_V = 7.4
-MOTOR_MAX_V = 6.0
-MAX_DUTY = min(MOTOR_MAX_V / MOTOR_BATTERY_V, 1.0) * 100  # ~81%
+# cap pwm if lipo larger than 3-6v
+MOTOR_BATTERY_V = 3.7
+MOTOR_MAX_V = 3.7
+MAX_DUTY = min(MOTOR_MAX_V / MOTOR_BATTERY_V, 1.0) * 100  # 100% now
 
 try:
     import RPi.GPIO as GPIO
@@ -42,10 +42,10 @@ try:
         GPIO.output(pin, False)
 
     _pwm = {
-        'left_ia': GPIO.PWM(MOTOR_PINS['left_ia'], 1000),
-        'left_ib': GPIO.PWM(MOTOR_PINS['left_ib'], 1000),
-        'right_ia': GPIO.PWM(MOTOR_PINS['right_ia'], 1000),
-        'right_ib': GPIO.PWM(MOTOR_PINS['right_ib'], 1000),
+        'left_ia': GPIO.PWM(MOTOR_PINS['left_ia'], 100),
+        'left_ib': GPIO.PWM(MOTOR_PINS['left_ib'], 100),
+        'right_ia': GPIO.PWM(MOTOR_PINS['right_ia'], 100),
+        'right_ib': GPIO.PWM(MOTOR_PINS['right_ib'], 100),
     }
     for p in _pwm.values():
         p.start(0)
@@ -100,20 +100,15 @@ def send_to_motors(v, omega):
     """
     v: forward speed in m/s (negative = reverse)
     omega: angular rate in rad/s (positive = left turn)
-
-    wheel mixing with ~10cm wheelbase:
-        left = v - omega * (wheelbase / 2)
-        right = v + omega * (wheelbase / 2)
     """
     if not _GPIO_AVAILABLE:
         print(f"  [motors] v={v:+.3f} m/s  w={omega:+.3f} rad/s")
         return
 
-    half = WHEELBASE / 2.0 # half the distance between wheels
-    # differential drive mixing: to turn left (positive omega), slow left wheel and speed up right
-    # omega * half converts angular rate to a linear speed difference at each wheel
-    left_frac = (v - omega * half) / MAX_V # normalize to -1..1 range
-    right_frac = (v + omega * half) / MAX_V # normalize to -1..1 range
+    v_frac = v / MAX_V
+    omega_frac = omega / MAX_OMEGA
+    left_frac = v_frac - omega_frac
+    right_frac = v_frac + omega_frac
 
     _drive('left', left_frac)
     _drive('right', right_frac)
@@ -126,5 +121,6 @@ def stop():
     if _GPIO_AVAILABLE:
         for p in _pwm.values():
             p.ChangeDutyCycle(0)
+            p.stop()
         GPIO.cleanup()
     print("  [motors] stop")
