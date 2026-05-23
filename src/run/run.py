@@ -62,13 +62,34 @@ def main():
     else:
         print("[run] no policy found, using random actions (run train/train_sac.py first)")
 
-    src = int(args.src) if args.src.isdigit() else args.src
-    cap = cv2.VideoCapture(src, cv2.CAP_V4L2 if isinstance(src, str) else cv2.CAP_ANY)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_W)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
-    cap.set(cv2.CAP_PROP_FPS, args.fps)
-    if not cap.isOpened():
-        print(f"[run] can't open source: {src}"); sys.exit(1)
+    # use picamera2 for pi camera (cv2.VideoCapture can't talk to libcamera on pi 5)
+    # fall back to cv2 for video files and laptop webcams
+    use_picam = args.src.isdigit() or args.src.startswith('/dev/video')
+    picam = None
+    cap = None
+
+    if use_picam:
+        try:
+            from picamera2 import Picamera2
+            picam = Picamera2()
+            cfg = picam.create_preview_configuration(
+                main={"size": (FRAME_W, FRAME_H), "format": "BGR888"}
+            )
+            picam.configure(cfg)
+            picam.start()
+            print("[run] picamera2 ready")
+        except Exception as e:
+            print(f"[run] picamera2 failed ({e}), falling back to cv2")
+            use_picam = False
+
+    if not use_picam:
+        src = int(args.src) if args.src.isdigit() else args.src
+        cap = cv2.VideoCapture(src, cv2.CAP_V4L2 if isinstance(src, str) else cv2.CAP_ANY)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_W)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
+        cap.set(cv2.CAP_PROP_FPS, args.fps)
+        if not cap.isOpened():
+            print(f"[run] can't open source: {args.src}"); sys.exit(1)
 
     dt = 1.0 / args.fps
     prev_bbox = None
@@ -87,12 +108,14 @@ def main():
         while True:
             t0 = time.time()
 
-            ret, frame = cap.read()
-            if not ret:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, 0) # loop video files
-                continue
-
-            frame = cv2.resize(frame, (FRAME_W, FRAME_H))
+            if use_picam:
+                frame = picam.capture_array()
+            else:
+                ret, frame = cap.read()
+                if not ret:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0) # loop video files
+                    continue
+                frame = cv2.resize(frame, (FRAME_W, FRAME_H))
 
             # detect cat
             raw_state, bbox = get_cat_state(frame, prev_bbox)
@@ -195,7 +218,10 @@ def main():
         pass
     finally:
         stop()
-        cap.release()
+        if picam:
+            picam.stop()
+        if cap:
+            cap.release()
         cv2.destroyAllWindows()
         print("\n[run] done.")
 
