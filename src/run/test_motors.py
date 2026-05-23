@@ -8,8 +8,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from motors import send_to_motors, stop, MAX_V, MAX_OMEGA
 
-DUTY = 0.5 # 50% speed for testing
-PAUSE = 1.5 # seconds per move
+DUTY = 0.8 # 80% speed for testing
+PAUSE = 2 # seconds per move
 
 tests = [
     ("forward",  DUTY * MAX_V, 0.0),
