@@ -159,8 +159,8 @@ def main():
                     search_dir = -np.sign(last_valid_state[1])  # spin toward last known side
                 else:
                     search_dir = 1.0 # no last known position, just spin left by default
-                v_safe = 0.0 # don't move forward while searching, just rotate
-                omega_safe = float(search_dir) * MAX_OMEGA * SEARCH_OMEGA_FRAC
+                # call safety layer
+                v_safe, omega_safe = safety_layer(0.0, float(search_dir) * MAX_OMEGA * SEARCH_OMEGA_FRAC, sensor_front)
                 mouse_speed = 0.0
                 action = np.array([0.0, float(search_dir) * SEARCH_OMEGA_FRAC]) # for logging only
             else:
