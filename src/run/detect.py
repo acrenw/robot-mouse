@@ -5,11 +5,11 @@ persist=True keeps bytetrack's kalman filter running between frames so it
 can predict where the cat is even when yolo misses a frame
 
 usage:
-    python run/detect.py data/videos/pounce-5.mp4
+    `python run/detect.py data/videos/pounce-5.mp4`
 
-# TODO: fine-tune yolov8s on dads cat footage to improve detection reliability
-# TODO: try lower conf threshold (0.05) in bad lighting conditions
-# TODO: wider FOV camera might help so the cat doesn't disappear at frame edges
+TODO: fine-tune yolov8s on dads cat footage to improve detection reliability
+TODO: try lower conf threshold (0.05) in bad lighting conditions
+TODO: wider FOV camera might help so the cat doesn't disappear at frame edges
 """
 
 import cv2

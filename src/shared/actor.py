@@ -3,8 +3,8 @@ actor network, shared between training and pi inference
 obs: [dist_proxy, angle, visible, cat_vx, cat_vy, sensor_front, mouse_speed]
 act: [v_raw, omega_raw] in [-1, 1], scaled by the caller
 
-# TODO: if inference is too slow on pi, export this to onnx
-# TODO: could try a bigger network (128 hidden) if the policy plateaus
+TODO: if inference is too slow on pi, export this to onnx
+TODO: could try a bigger network (128 hidden) if the policy plateaus
 """
 
 import torch

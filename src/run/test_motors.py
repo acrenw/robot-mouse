@@ -1,6 +1,6 @@
 """
 usage:
-    python run/test_motors.py
+    `python run/test_motors.py`
 """
 
 import sys, os, time

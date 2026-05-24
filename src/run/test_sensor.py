@@ -2,7 +2,7 @@
 HC-SR04 sensor test
 
 usage:
-    python run/test_sensor.py
+    `python run/test_sensor.py`
 """
 
 import sys, os, time

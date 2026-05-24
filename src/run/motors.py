@@ -12,8 +12,8 @@ l9110 wiring:
     l9110 VCC -> pi 5V
     all GNDs -> common ground (pi GND + lipo GND + l9110 GND)
 
-# TODO: measure actual wheelbase when chasis done and update WHEELBASE constant
-# TODO: add encoder feedback for closed loop speed control if motors drift
+TODO: measure actual wheelbase when chasis done and update WHEELBASE constant
+TODO: add encoder feedback for closed loop speed control if motors drift
 """
 
 import time

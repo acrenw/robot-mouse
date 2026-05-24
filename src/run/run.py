@@ -3,21 +3,21 @@ main inference loop
 camera/video -> yolo -> obs -> SAC actor -> safety layer -> motors
 
 usage:
-    # test on a video file (laptop):
-    python run/run.py --src data/videos/pounce-5.mp4
+    test on a video file (laptop):
+    `python run/run.py --src data/videos/pounce-5.mp4`
 
-    # test on webcam:
-    python run/run.py --src 0
+    test on webcam:
+    `python run/run.py --src 0`
 
-    # pi with camera (add --headless if running over SSH):
-    python run/run.py --src /dev/video0 --headless
+    pi with camera (add --headless if running over SSH):
+    `python run/run.py --src /dev/video0 --headless`
 
-    # test without a trained policy (random actions, still tests the pipeline):
-    python run/run.py --src data/videos/pounce-5.mp4 --no-policy
+    test without a trained policy (random actions, still tests the pipeline):
+    `python run/run.py --src data/videos/pounce-5.mp4 --no-policy`
 
-# TODO: add speaker that plays a sound when cat is detected or gets close
-# TODO: add snack servo that dispenses a treat after the robot teases the cat
-# TODO: add --headless flag properly so this runs cleanly over SSH on pi
+TODO: add speaker that plays a sound when cat is detected or gets close
+TODO: add snack servo that dispenses a treat after the robot teases the cat
+TODO: add --headless flag properly so this runs cleanly over SSH on pi
 """
 
 import sys, os, argparse, time
@@ -31,6 +31,8 @@ from shared.actor import Actor, OBS_DIM
 from detect import get_cat_state, draw_debug, FRAME_W, FRAME_H
 from motors import safety_layer, send_to_motors, stop, MAX_V, MAX_OMEGA
 from sensors import read_front_m
+from speaker import maybe_squeak
+from servo import dispense
 
 POLICY_PATH = os.path.join(os.path.dirname(__file__), '..', 'shared', 'mouse_policy.pt')
 
@@ -102,6 +104,11 @@ def main():
     SEARCH_OMEGA_FRAC = 0.7 # how fast to spin when searching (fraction of MAX_OMEGA)
     last_valid_state = None
     last_detect_time = None
+
+    CATCH_DIST = 0.08 # dist_proxy below this means cat is basically on top of the robot
+    CATCH_TIME = 0.3 # cat has to stay that close for 0.3s to avoid false triggers from fast passes
+    catch_start = None
+    treat_given = False
 
     print(f"[run] starting loop at {args.fps} hz\n")
     try:
@@ -201,6 +208,23 @@ def main():
                 mouse_speed = abs(v_safe) # track speed for the obs next frame
 
             send_to_motors(v_safe, omega_safe)
+
+            now_t = time.time()
+
+            if cat_state[2] == 1.0:
+                maybe_squeak(cat_state[0], cat_state[3], cat_state[4], True, now_t)
+
+            # dispense treat when cat is close enough that it's basically touching the robot
+            # dist_proxy comes from bounding box size (when the cat fills the frame it drops near 0)
+            # the 0.3s debounce stops a fast close pass from triggering the treat
+            if cat_state[2] == 1.0 and cat_state[0] < CATCH_DIST:
+                if catch_start is None:
+                    catch_start = now_t
+                elif now_t - catch_start >= CATCH_TIME and not treat_given:
+                    dispense()
+                    treat_given = True
+            else:
+                catch_start = None
 
             mode_tag = " [search]" if search_mode else (" [stale]" if stale else "")
             print(f"  [state] d={cat_state[0]:.2f} ang={cat_state[1]:.2f} "

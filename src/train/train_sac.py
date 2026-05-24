@@ -4,15 +4,16 @@ cat moves with a state machine
 (wander -> stalk -> pounce -> flee)
 no real camera needed
 
-output: src/shared/mouse_policy.pt
+output: 
+    src/shared/mouse_policy.pt
 
 usage:
-    python train/train_sac.py
+    `python train/train_sac.py`
 
-# TODO: train longer (500k+ steps) if avg_dist isn't settling in the play zone
-# TODO: try curriculum learning (start cat closer, increase distance over time)
-# TODO: add domain randomization (vary cat speed, stalk patience, etc)
-# TODO: export policy to onnx for faster inference on pi
+TODO: train longer (500k+ steps) if avg_dist isn't settling in the play zone
+TODO: try curriculum learning (start cat closer, increase distance over time)
+TODO: add domain randomization (vary cat speed, stalk patience, etc)
+TODO: export policy to onnx for faster inference on pi
 """
 
 import sys, os
