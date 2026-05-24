@@ -28,9 +28,13 @@ while True:
     elif cmd == 'o':
         print(f"opening (duty={OPEN_DUTY})")
         _pwm.ChangeDutyCycle(OPEN_DUTY)
+        time.sleep(0.5)
+        _pwm.ChangeDutyCycle(0)
     elif cmd == 'c':
         print(f"closing (duty={CLOSED_DUTY})")
         _pwm.ChangeDutyCycle(CLOSED_DUTY)
+        time.sleep(0.5)
+        _pwm.ChangeDutyCycle(0)
     elif cmd == 'd':
         print("dispensing...")
         from servo import dispense
@@ -41,5 +45,7 @@ while True:
             duty = float(cmd)
             print(f"setting duty={duty}")
             _pwm.ChangeDutyCycle(duty)
+            time.sleep(0.5)
+            _pwm.ChangeDutyCycle(0)
         except ValueError:
             print("Didn't get that. Try o, c, d, a number like 10.5, or q")

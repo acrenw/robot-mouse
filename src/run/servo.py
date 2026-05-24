@@ -23,7 +23,7 @@ try:
     GPIO.setmode(GPIO.BCM)
     GPIO.setup(SERVO_PIN, GPIO.OUT)
     _pwm = GPIO.PWM(SERVO_PIN, 50)
-    _pwm.start(CLOSED_DUTY)
+    _pwm.start(0) # start silent, only pulse when moving, stops jitter
     _ok = True
     print("[servo] mg90s ready on GPIO 12")
 except Exception as e:
