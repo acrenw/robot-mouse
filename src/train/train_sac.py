@@ -4,7 +4,7 @@ cat moves with a state machine
 (wander -> stalk -> pounce -> flee)
 no real camera needed
 
-output: 
+output:
     src/shared/mouse_policy.pt
 
 usage:
@@ -12,12 +12,12 @@ usage:
 
 TODO: train longer (500k+ steps) if avg_dist isn't settling in the play zone
 TODO: try curriculum learning (start cat closer, increase distance over time)
-TODO: add domain randomization (vary cat speed, stalk patience, etc)
 TODO: export policy to onnx for faster inference on pi
+TODO: fine tune the actor directly on real transitions, currently using real videos / logs to recalibrate the sim
 """
 
 import sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..')) # for importing from shared/
 
 import numpy as np
 import torch
@@ -27,51 +27,39 @@ import torch.optim as optim
 from collections import deque
 import random
 
-from shared.actor import Actor, OBS_DIM, ACT_DIM
-
-# hyperparameters
-TOTAL_STEPS = 200_000
-BUFFER_SIZE = 50_000
-BATCH = 128
-LR = 3e-4
-GAMMA = 0.99
-TAU = 0.005
-TARGET_ENTROPY = -float(ACT_DIM)
-LEARN_START = 2_000
-MAX_V = 0.3
-MAX_OMEGA = 2.0
-
-# cat state machine thresholds
-STALK_ENTER_DIST = 0.50 # cat starts stalking when mouse gets this close
-STALK_EXIT_DIST = 0.55 # hysteresis, cat stops stalking if mouse gets this far
-STALK_STEPS_REQ = 35 # how long cat stalks before pouncing
-POUNCE_SPEED = 0.12 # how fast the cat moves when pouncing
-STALK_DRIFT_SPEED = 0.04 # how fast cat drifts toward mouse while stalking
-WANDER_SPEED_MAX = 0.08 # max cat speed when wandering
-
-# reward zone boundaries
-CAPTURE_DIST = 0.06 # closer than this = captured
-DANGER_DIST = 0.15 # in the danger zone (between capture and here)
-PLAY_DIST_HI = 0.35 # ideal play zone is 0.15 to 0.35
-APPROACH_DIST = 0.65 # approach zone is 0.35 to 0.65, beyond = too far
-
-# teasing reward thresholds
-CAT_STATIONARY_THRESH = 0.025
-MOUSE_TEASE_THRESH = 0.10
-
-MAX_EVASIONS = 5
-
-# normalize rewards before pushing to buffer so Q-values don't blow up
-# raw rewards range roughly -2.5 to 1.5, dividing by 3.5 keeps them in -0.7 to 0.4
-# logs still show raw rewards so they're easier to read
-REWARD_SCALE = 3.5
-
-# flee state
-CLOSE_DIST = 0.20 # if mouse is this close for too long, cat flees
-FLEE_ENTER_STEPS = 10 # how many consecutive close steps before fleeing
-FLEE_SPEED = 0.12 # how fast cat runs away
-FLEE_EXIT_DIST = 0.55 # cat stops fleeing once it gets this far
-FLEE_MAX_STEPS = 40 # max steps cat flees before going back to wandering
+from shared.actor import Actor, OBS_DIM, ACT_DIM, HIDDEN
+from train.train_config import (
+    TOTAL_STEPS, BUFFER_SIZE, BATCH, LR, GAMMA, TAU, LEARN_START,
+    LOG_ALPHA_CLAMP_MIN, GRAD_CLIP_MAX_NORM, TARGET_ENTROPY, LOG_WINDOW_SIZE,
+    MAX_V, MAX_OMEGA,
+    SIM_DT, WORLD_X_MIN, WORLD_X_MAX, WORLD_Y_MIN, WORLD_Y_MAX,
+    OBS_DIST_SCALE, VISIBILITY_RANGE, MAX_EP_STEPS, OUTPUT_DIM,
+    STALK_ENTER_DIST_RANGE, STALK_EXIT_BUFFER, STALK_STEPS_REQ_RANGE,
+    POUNCE_SPEED_RANGE, WANDER_SPEED_MAX_RANGE,
+    CAT_START_VX_RANGE, CAT_START_VY_RANGE,
+    POUNCE_MISS_DIST, WANDER_ACCEL_NOISE,
+    CLOSE_DIST, LEAVE_ENTER_STEPS, LEAVE_SPEED, LEAVE_EXIT_DIST, LEAVE_MAX_STEPS,
+    WOBBLE_FREQ_HZ_RANGE, WOBBLE_AMP_RANGE,
+    CAT_STATIONARY_SPEED_THRESH,
+    CAPTURE_DIST, DANGER_DIST, PLAY_DIST_HI, APPROACH_DIST,
+    CAPTURE_FINAL_REWARD, CAPTURE_PENALTY, DANGER_BASE_PENALTY,
+    PLAY_ZONE_REWARD, TOO_FAR_PENALTY, DODGE_BONUS, REWARD_SCALER,
+    MOUSE_TEASE_SPEED_THRESH, TEASE_BONUS, TEASE_STATIONARY_STEPS,
+    POUNCE_FREEZE_PENALTY_BASE, POUNCE_FREEZE_SCALE_DIVISOR,
+    MAX_CAPTURE_COUNT,
+    UNPREDICTABILITY_WINDOW, UNPREDICTABILITY_BONUS, UNPREDICTABILITY_STD_NORM,
+    SMOOTHNESS_PENALTY_WEIGHT,
+    VISIBILITY_BONUS,
+    ENERGY_COST_WEIGHT,
+    COVERAGE_GRID_SIZE, COVERAGE_BONUS,
+    WALL_MARGIN, WALL_PENALTY,
+    TIREDNESS_RATE, TIREDNESS_RECOVERY_RATE, MAX_TIREDNESS,
+    TIREDNESS_SPEED_SCALE, TIREDNESS_POST_REVIVE,
+    ENGAGEMENT_BONUS,
+    PLAY_DEAD_DURATION, PLAY_DEAD_COOLDOWN,
+    SURVIVAL_REWARD,
+    FREEZE_SPEED_THRESHOLD, FREEZE_PENALTY,
+)
 
 
 class Critic(nn.Module):
@@ -82,26 +70,33 @@ class Critic(nn.Module):
         super().__init__()
         def _q():
             return nn.Sequential(
-                nn.Linear(OBS_DIM + ACT_DIM, 64), nn.ReLU(),
-                nn.Linear(64, 64), nn.ReLU(),
-                nn.Linear(64, 1),
+                nn.Linear(OBS_DIM + ACT_DIM, HIDDEN), nn.ReLU(), # torch randomly seeds each layer
+                nn.Linear(HIDDEN, HIDDEN), nn.ReLU(),
+                nn.Linear(HIDDEN, OUTPUT_DIM),
             )
         self.q1, self.q2 = _q(), _q()
 
     def forward(self, obs, act):
-        x = torch.cat([obs, act], dim=-1)
+        x = torch.cat([obs, act], dim=-1) # concatenates along dim
+        # returns q values directly because no random sampling from distribution is involved in critic
+        # returns two and not just a min of the two because we need both to train both networks in mse_loss with different q's
         return self.q1(x), self.q2(x)
 
 
 class ReplayBuffer:
     def __init__(self, cap):
-        self.buf = deque(maxlen=cap)
+        self.buf = deque(maxlen=cap) # pops overflow automatically, we never need to pop manually
 
-    def push(self, *transition):
-        self.buf.append(transition)
+    def push(self, *transition): # takes many arguments and bundles as one tuple
+        self.buf.append(transition) # appends tuple as single item
 
     def sample(self, n):
         batch = random.sample(self.buf, n)
+
+        # *batch unpacks batch of tuples into zip
+        # zip groups same index in tuples to new tuples
+        # make each new tuple into its own tensor, each with batch size length
+        # return an array of tensors, length is amount of transitions
         return [torch.FloatTensor(np.array(x)) for x in zip(*batch)]
 
     def __len__(self):
@@ -120,12 +115,17 @@ class MouseSACAgent:
     def __init__(self):
         self.actor = Actor()
         self.critic = Critic()
-        self.critic_tgt = Critic()
-        self.critic_tgt.load_state_dict(self.critic.state_dict())
+        # make copy of critic to solve moving target problem
+        # the target network is updated by critic with TAU, not an optimizer
+        self.critic_target = Critic()
+        self.critic_target.load_state_dict(self.critic.state_dict()) # replace random weights so this is an identical copy of self.critic
 
         self.actor_opt = optim.Adam(self.actor.parameters(), lr=LR)
         self.critic_opt = optim.Adam(self.critic.parameters(), lr=LR)
 
+        # log_alpha sets how much actor cares about the entropy (log_std sets actual entropy)
+        # is a parameter because we need to constantly adjust it
+        # log_alpha scales how much a_loss pushes log_std up / down, based on whether current entropy (lp, driven by log_std) is above or below TARGET_ENTROPY
         self.log_alpha = torch.tensor(0.0, requires_grad=True)
         self.alpha_opt = optim.Adam([self.log_alpha], lr=LR)
 
@@ -136,65 +136,71 @@ class MouseSACAgent:
         explore=True: stochastic (used during training)
         explore=False: greedy (used for eval)
         """
-        obs_t = torch.FloatTensor(obs_np).unsqueeze(0)
-        with torch.no_grad():
+        obs_t = torch.FloatTensor(obs_np).unsqueeze(0) # convert np -> tensor and add batch dim (1 obs in batch)
+        with torch.no_grad(): # don't need to build autograd computation graph (needed in backprop in mse loss), we're not training just deciding what to do next, it's required in update
             if explore:
                 action, _ = self.actor.get_action(obs_t)
             else:
                 action = self.actor.get_deterministic_action(obs_t)
+        # squeeze() w/o args removes every dim of size 1
         return action.squeeze().numpy()
 
     def update(self, batch):
         """
         one SAC gradient step.
-        batch: [O, A, R, NO, D] FloatTensors from ReplayBuffer.sample()
+        batch: [Observation, Action, Reward, NextObservation, Done] FloatTensors from ReplayBuffer.sample()
         """
         O, A, R, NO, D = batch
-        alpha = self.log_alpha.exp().detach()
+        alpha = self.log_alpha.exp().detach() # detaches this tensor from autograd graph (gets rid of computation history, treated like a constant)
 
         # critic update
         with torch.no_grad():
-            na, nlp = self.actor.get_action(NO) # sample next action from current policy
-            q1t, q2t = self.critic_tgt(NO, na) # get Q values from target network (more stable)
-            # bellman target: reward + discounted future value, minus entropy bonus
-            # (1-D) masks out terminal states so we don't bootstrap past episode end
-            # torch.min takes the more pessimistic Q estimate to prevent overestimation
-            y = R + GAMMA * (1 - D) * (torch.min(q1t, q2t) - alpha * nlp)
+            next_action, next_log_prob = self.actor.get_action(NO) # sample next action from current policy
+            q1_target, q2_target = self.critic_target(NO, next_action) # get Q values from target network (more stable)
+            # target = reward + scaling factor * (future value - entropy)
+            # (1-D) to get only valid steps
+            target = R + GAMMA * (1 - D) * (torch.min(q1_target, q2_target) - alpha * next_log_prob)
 
         q1, q2 = self.critic(O, A) # Q values for the actions we actually took
-        c_loss = F.mse_loss(q1, y) + F.mse_loss(q2, y) # both heads should predict y
-        self.critic_opt.zero_grad(); c_loss.backward()
-        nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=1.0) # prevent gradient explosion
+        self.critic_opt.zero_grad() # zeros optimizer in case of fine tuning nn (like one layer, dont wanna zero everything)
+        q1_loss = F.mse_loss(q1, target)
+        q2_loss = F.mse_loss(q2, target)
+        q1_loss.backward() # computes and accumulates new gradients on old one (in entire critic parameter space)
+        q2_loss.backward()
+        nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=GRAD_CLIP_MAX_NORM)
         self.critic_opt.step()
 
         # actor update
-        new_a, lp = self.actor.get_action(O) # sample fresh actions (can't reuse above, need gradients)
-        q1n, q2n = self.critic(O, new_a) # how good does critic think these actions are
-        # maximize Q - alpha*entropy: actor tries to find high-value actions while staying exploratory
-        a_loss = (alpha * lp - torch.min(q1n, q2n)).mean()
-        self.actor_opt.zero_grad(); a_loss.backward()
-        nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
+        new_action, log_prob = self.actor.get_action(O) # sample actions from current obs
+        q1n, q2n = self.critic(O, new_action) # how good does critic thinks current actions are
+        # want to minimize a_loss -> minimize -Q -> maximize Q, with entropy, then take mean of batch
+        a_loss = (alpha * log_prob - torch.min(q1n, q2n)).mean() # although this uses critic's weights, doesnt matter in terms of autograd graph bc actor_opt is only constructed with actor parameters
+        self.actor_opt.zero_grad()
+        a_loss.backward() # retain_graph = False by default, so after this previously built autograd graph is gone
+        nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=GRAD_CLIP_MAX_NORM)
         self.actor_opt.step()
 
-        # alpha (entropy) update: auto-tune how much we weight exploration vs exploitation
-        # if entropy is too low (lp + TARGET_ENTROPY > 0), increase alpha to encourage more exploration
-        al_loss = -(self.log_alpha * (lp + TARGET_ENTROPY).detach()).mean()
-        self.alpha_opt.zero_grad(); al_loss.backward(); self.alpha_opt.step()
-        # clamp log_alpha so alpha never goes below exp(-3) ~= 0.05
+        # log_alpha (entropy) update: auto-tune how much we weight exploration vs exploitation
+        # if entropy is too low (log_prob + TARGET_ENTROPY > 0), increase log_alpha to encourage more exploration
+        al_loss = -(self.log_alpha * (log_prob + TARGET_ENTROPY).detach()).mean()
+        self.alpha_opt.zero_grad()
+        al_loss.backward()
+        self.alpha_opt.step()
+        # clamp log_alpha so log_alpha never goes below exp(-3) ~= 0.05
         # without this the agent stops exploring completely around episode 40 and gets stuck
         with torch.no_grad():
-            self.log_alpha.clamp_(min=-3.0)
+            self.log_alpha.clamp_(min=LOG_ALPHA_CLAMP_MIN)
 
         # slowly blend target critic toward current critic (TAU=0.005 = 0.5% per step)
         # using a slowly-updated target makes training much more stable than updating it directly
-        for s, t in zip(self.critic.parameters(), self.critic_tgt.parameters()):
+        for s, t in zip(self.critic.parameters(), self.critic_target.parameters()):
             t.data.copy_(TAU * s.data + (1 - TAU) * t.data)
 
         return {
-            "critic_loss": c_loss.item(),
-            "actor_loss": a_loss.item(),
+            "critic_loss": (q1_loss + q2_loss).item(), # just for rough gage of whether model is learning
+            "actor_loss": a_loss.item(), # .item() converts 0d tensor -> float
             "alpha_loss": al_loss.item(),
-            "alpha": self.log_alpha.exp().item(),
+            "log_alpha": self.log_alpha.exp().item(),
         }
 
     def save(self, path):
@@ -207,8 +213,8 @@ class MouseSACAgent:
 
 class CatSimEnv:
     """
-    2D sim with a four-state cat (wander / stalk / pounce / flee)
-    and a capture + evasion mechanic.
+    2D sim with a multi-state cat and a mouse that gets tired, plays dead,
+    and earns rewards for engaging, unpredictable, smooth movement.
 
     obs: [dist, angle, visible, cat_vx, cat_vy, sensor_front, mouse_speed]
     act: [v_raw, omega_raw] in [-1, 1]
@@ -217,63 +223,96 @@ class CatSimEnv:
     # TODO: add multiple cat sim to train for scenarios with multiple cats in view
     """
 
-    def __init__(self):
+    def __init__(self): # gets called once
         self.cat_vx = self.cat_vy = 0.0
         self.mouse_speed = 0.0
         self.cat_state = "wandering"
-        self.stalk_steps = self.stationary_steps = self.evasion_count = 0
-        self.close_steps = self.flee_steps = 0
+        self.stalk_steps = self.stationary_steps = self.capture_count = self.close_steps = self.leave_steps = 0
+
+        self.tiredness = 0.0
+        self.effective_max_v = MAX_V
+        self.playing_dead = False
+        self.play_dead_timer = 0
+        self.play_dead_cooldown_timer = 0
+        self.action_history = deque(maxlen=UNPREDICTABILITY_WINDOW)
+        self.prev_action = None
+        self.current_action = None
+        self.visited_cells = set()
+        self.just_visited_new_cell = False
+
         self.reset()
 
-    def reset(self):
-        # keep re-rolling until cat starts at a reasonable distance (approach zone)
-        # if cat starts too far away (dist > 0.65) every step gets -0.5 reward with no
-        # gradient signal pointing toward the cat, so the agent never learns anything
-        # if cat starts too close (dist < 0.30) the agent just runs away from the start
-        while True:
-            self.cat_x = np.random.uniform(-1, 1)
-            self.cat_y = np.random.uniform(0.2, 1.5)
-            if 0.30 <= np.hypot(self.cat_x, self.cat_y) / 2.0 <= 0.65: # /2.0 normalizes to [0,1] range
-                break
+    # per episode domain randomization of FSM thresholds + wobble
+    def _sample_cat_params(self):
+        self.stalk_enter_dist = np.random.uniform(*STALK_ENTER_DIST_RANGE) # unpacks tuple into two arguments
+        self.stalk_exit_dist = self.stalk_enter_dist + STALK_EXIT_BUFFER
+        self.stalk_steps_req = np.random.randint(*STALK_STEPS_REQ_RANGE)
+        self.pounce_speed = np.random.uniform(*POUNCE_SPEED_RANGE)
+        self.wander_speed_max = np.random.uniform(*WANDER_SPEED_MAX_RANGE)
+        self.wobble_freq_hz = np.random.uniform(*WOBBLE_FREQ_HZ_RANGE)
+        self.wobble_amp = np.random.uniform(*WOBBLE_AMP_RANGE)
+
+        # random phase offset so the wobble doesn't always start at the same point in its cycle when stalking begins
+        self.wobble_phase0 = np.random.uniform(0, 2 * np.pi)
+
+    def reset(self): # gets called every episode
+        # sample this episode's randomized FSM thresholds + wobble params
+        self._sample_cat_params()
+
+        # randomize cat starting xy
+        dist = np.random.uniform(PLAY_DIST_HI, APPROACH_DIST)
+        angle = np.random.uniform(0, 2 * np.pi)
+        self.cat_x = dist * OBS_DIST_SCALE * np.sin(angle)
+        self.cat_y = dist * OBS_DIST_SCALE * np.cos(angle)
 
         self.mouse_x = 0.0
         self.mouse_y = 0.0
         self.mouse_heading = 0.0
         self.mouse_speed = 0.0
-        self.cat_vx = np.random.uniform(-0.05, 0.05)
-        self.cat_vy = np.random.uniform(-0.01, 0.04)
+        self.cat_vx = np.random.uniform(*CAT_START_VX_RANGE)
+        self.cat_vy = np.random.uniform(*CAT_START_VY_RANGE)
         self.cat_state = "wandering"
         self.stalk_steps = 0
         self.stationary_steps = 0
-        self.evasion_count = 0
+        self.capture_count = 0
         self.close_steps = 0
-        self.flee_steps = 0
+        self.leave_steps = 0
         self.step_n = 0
+
+        self.tiredness = 0.0
+        self.effective_max_v = MAX_V
+        self.playing_dead = False
+        self.play_dead_timer = 0
+        self.play_dead_cooldown_timer = 0
+        self.action_history.clear()
+        self.prev_action = None
+        self.current_action = None
+        self.visited_cells = set()
+        self.just_visited_new_cell = False
+
         return self._obs()
 
-    def _obs(self):
-        dx = self.cat_x - self.mouse_x # horizontal offset from mouse to cat
-        dy = self.cat_y - self.mouse_y # vertical offset from mouse to cat
-        # hypot = straight-line distance. /2.0 normalizes the sim space so dist=1 means very far
-        dist = np.clip(np.hypot(dx, dy) / 2.0, 0.0, 1.0)
-        # robot-relative angle: positive = cat is to the right of where we're facing
-        # this matches detect.py where positive angle = cat right of frame center
-        world_angle = np.arctan2(dx, dy) # angle to cat in world frame (north = 0)
+    def _obs(self): # returned in step()
+        dx = self.cat_x - self.mouse_x
+        dy = self.cat_y - self.mouse_y
+        dist = np.clip(np.hypot(dx, dy) / OBS_DIST_SCALE, 0.0, 1.0)
+
+        world_angle = np.arctan2(dx, dy) # angle to cat in world frame, positive = cat is to the right of where we're facing (matches detect.py)
         # subtract mouse heading to get angle relative to which way the robot is pointing
         # the +pi) % 2pi - pi trick wraps the result into [-pi, pi] cleanly
         rel_angle = (world_angle - self.mouse_heading + np.pi) % (2 * np.pi) - np.pi
         angle = np.clip(rel_angle / np.pi, -1.0, 1.0) # normalize to [-1, 1]
-        visible = float(dist < 0.7) # cat counts as visible if it's within 70% of max range
-        return np.array(
-            [dist, angle, visible, self.cat_vx, self.cat_vy, 1.0, self.mouse_speed],
-            dtype=np.float32,
-        )
+
+        visible = float(dist < VISIBILITY_RANGE)
+
+        return np.array([dist, angle, visible, self.cat_vx, self.cat_vy, 1.0, self.mouse_speed], dtype=np.float32) # TODO: change 1.0 placeholder to be actual sensor stuff
 
     def _update_cat(self, dist):
         """
         advance cat state machine and move cat
         returns cat_speed
         """
+        self.just_dodged = False
 
         # track how long mouse has been uncomfortably close
         if dist < CLOSE_DIST:
@@ -281,158 +320,366 @@ class CatSimEnv:
         else:
             self.close_steps = 0
 
-        # flee overrides everything if mouse has been too close too long
-        if self.cat_state != "fleeing" and self.close_steps >= FLEE_ENTER_STEPS:
-            self.cat_state = "fleeing"
-            self.flee_steps = 0
+        # cat leave overrides everything if mouse has been too close too long
+        if self.cat_state != "leaving" and self.close_steps >= LEAVE_ENTER_STEPS:
+            self.cat_state = "leaving"
+            self.leave_steps = 0
             self.stalk_steps = 0
 
-        if self.cat_state == "fleeing":
-            self.flee_steps += 1
-            if dist > FLEE_EXIT_DIST or self.flee_steps >= FLEE_MAX_STEPS:
+        if self.cat_state == "leaving":
+            self.leave_steps += 1
+            if dist > LEAVE_EXIT_DIST or self.leave_steps >= LEAVE_MAX_STEPS:
                 self.cat_state = "wandering"
                 self.close_steps = 0
-                self.flee_steps = 0
+                self.leave_steps = 0
 
         elif self.cat_state == "wandering":
-            if dist < STALK_ENTER_DIST:
+            if dist < self.stalk_enter_dist:
                 self.cat_state = "stalking"
                 self.stalk_steps = 0
 
         elif self.cat_state == "stalking":
-            if dist > STALK_EXIT_DIST:
+            if dist > self.stalk_exit_dist:
                 self.cat_state = "wandering"
                 self.stalk_steps = 0
-            elif self.stalk_steps >= STALK_STEPS_REQ:
+            elif self.stalk_steps >= self.stalk_steps_req:
                 self.cat_state = "pouncing"
                 self.stalk_steps = 0
+                self.pounce_entry_stationary_steps = self.stationary_steps  # remember how locked in cat was right before pouncing
             else:
                 self.stalk_steps += 1
 
         elif self.cat_state == "pouncing":
-            if dist > 0.7 or dist < CAPTURE_DIST:
+            if dist < CAPTURE_DIST:
                 self.cat_state = "wandering"
                 self.stalk_steps = 0
+            elif dist > POUNCE_MISS_DIST:
+                self.cat_state = "wandering"
+                self.stalk_steps = 0
+                self.just_dodged = True
 
         # set velocity based on current state
         dx_to_mouse = self.mouse_x - self.cat_x
         dy_to_mouse = self.mouse_y - self.cat_y
-        mag = np.hypot(dx_to_mouse, dy_to_mouse) + 1e-6
+        dist_to_mouse = np.hypot(dx_to_mouse, dy_to_mouse) + 1e-6
+        dir_x = dx_to_mouse / dist_to_mouse  # unit vector toward mouse, computed ONCE
+        dir_y = dy_to_mouse / dist_to_mouse
 
         if self.cat_state == "wandering":
-            self.cat_vx = np.clip(
-                self.cat_vx + np.random.uniform(-0.01, 0.01), -WANDER_SPEED_MAX, WANDER_SPEED_MAX
-            )
-            self.cat_vy = np.clip(
-                self.cat_vy + np.random.uniform(-0.01, 0.01), -WANDER_SPEED_MAX, WANDER_SPEED_MAX
-            )
-        elif self.cat_state == "fleeing":
-            self.cat_vx = -(dx_to_mouse / mag) * FLEE_SPEED
-            self.cat_vy = -(dy_to_mouse / mag) * FLEE_SPEED
-        else: # stalking or pouncing
-            spd = STALK_DRIFT_SPEED if self.cat_state == "stalking" else POUNCE_SPEED
-            self.cat_vx = (dx_to_mouse / mag) * spd
-            self.cat_vy = (dy_to_mouse / mag) * spd
+            self.cat_vx = np.clip(self.cat_vx + np.random.uniform(-WANDER_ACCEL_NOISE, WANDER_ACCEL_NOISE), -self.wander_speed_max, self.wander_speed_max)
+            self.cat_vy = np.clip(self.cat_vy + np.random.uniform(-WANDER_ACCEL_NOISE, WANDER_ACCEL_NOISE), -self.wander_speed_max, self.wander_speed_max)
+        elif self.cat_state == "leaving":
+            self.cat_vx = -dir_x * LEAVE_SPEED
+            self.cat_vy = -dir_y * LEAVE_SPEED
+        elif self.cat_state == "stalking": # before pouncing
+            perp_x, perp_y = -dir_y, dir_x # perpendicular to the approach direction
 
-        # move cat, bounce off walls
-        new_x = self.cat_x + self.cat_vx
-        new_y = self.cat_y + self.cat_vy
-        clipped_x = np.clip(new_x, -2.0, 2.0)
-        clipped_y = np.clip(new_y, 0.0, 3.0)
-        if clipped_x != new_x: self.cat_vx *= -1
-        if clipped_y != new_y: self.cat_vy *= -1
+            # actual s passed = steps * SIM_DT, rad/s = 2*pi*f
+            phase = self.wobble_phase0 + self.stalk_steps * SIM_DT * 2 * np.pi * self.wobble_freq_hz
+            wobble = np.sin(phase) * self.wobble_amp
+
+            self.cat_vx = perp_x * wobble
+            self.cat_vy = perp_y * wobble
+        else: # pouncing
+            self.cat_vx = dir_x * self.pounce_speed
+            self.cat_vy = dir_y * self.pounce_speed
+
+        # move cat, stop at walls
+        new_x = self.cat_x + self.cat_vx * SIM_DT
+        new_y = self.cat_y + self.cat_vy * SIM_DT
+        clipped_x = np.clip(new_x, WORLD_X_MIN, WORLD_X_MAX)
+        clipped_y = np.clip(new_y, WORLD_Y_MIN, WORLD_Y_MAX)
+        if clipped_x != new_x: self.cat_vx *= 0.0
+        if clipped_y != new_y: self.cat_vy *= 0.0
         self.cat_x, self.cat_y = clipped_x, clipped_y
 
         cat_speed = np.hypot(self.cat_vx, self.cat_vy)
-        if cat_speed < CAT_STATIONARY_THRESH:
+        if cat_speed < CAT_STATIONARY_SPEED_THRESH:
             self.stationary_steps += 1
         else:
             self.stationary_steps = 0
 
-        return cat_speed
+    def _wall_closeness(self):
+        closest = min(
+            self.mouse_x - WORLD_X_MIN,
+            WORLD_X_MAX - self.mouse_x,
+            self.mouse_y - WORLD_Y_MIN,
+            WORLD_Y_MAX - self.mouse_y,
+        )
+        if closest < WALL_MARGIN:
+            return 1.0 - (closest / WALL_MARGIN) # closer you are, higher the return
+        return 0.0
 
-    def _reward(self, dist, captured, cat_speed):
+    def _update_coverage(self):
+        gx = int((self.mouse_x - WORLD_X_MIN) / COVERAGE_GRID_SIZE)
+        gy = int((self.mouse_y - WORLD_Y_MIN) / COVERAGE_GRID_SIZE)
+        cell = (gx, gy)
+        self.just_visited_new_cell = cell not in self.visited_cells # used in reward for novelty
+        self.visited_cells.add(cell)
+
+    def _update_tiredness(self):
+        speed_ratio = self.mouse_speed / MAX_V
+        self.tiredness += TIREDNESS_RATE * speed_ratio
+        self.tiredness -= TIREDNESS_RECOVERY_RATE * (1.0 - speed_ratio) # the slower you ar the faster you recover
+        self.tiredness = np.clip(self.tiredness, 0.0, MAX_TIREDNESS)
+        self.effective_max_v = MAX_V * (1.0 - self.tiredness * TIREDNESS_SPEED_SCALE) # max v of untired parts of self
+
+    def _reward(self, dist, captured): # returned in step()
         """
-        zone based reward with teasing and pounce freeze bonuses
+        zone based reward with teasing, pounce freeze, unpredictability,
+        smoothness, visibility, energy cost, coverage, wall avoidance,
+        engagement, survival, tiredness, and play-dead mechanics
         """
+        # no reward (neutral) while playing dead when not captured, like a sleep
+        if self.playing_dead and not captured:
+            return 0.0
+
+        r = 0.0
+
+        # base zone rewards
         if captured:
-            r = +1.5 if self.evasion_count >= MAX_EVASIONS else -2.0
+            # positive reward if exceeded max capture count per episode to make sure you're letting the cat win once in a while to keep it engaged
+            r = CAPTURE_FINAL_REWARD if self.capture_count >= MAX_CAPTURE_COUNT else CAPTURE_PENALTY
         elif dist < DANGER_DIST:
-            r = -1.0 + (self.mouse_speed / MAX_V) # reward fast escape
+            r = DANGER_BASE_PENALTY + (self.mouse_speed / MAX_V)
         elif dist < PLAY_DIST_HI:
-            r = +1.0 # ideal zone
+            r = PLAY_ZONE_REWARD
         elif dist < APPROACH_DIST:
             t = (APPROACH_DIST - dist) / (APPROACH_DIST - PLAY_DIST_HI)
             r = float(np.clip(t, 0.0, 1.0))
         else:
-            r = -0.5 # too far, go find the cat
+            r = TOO_FAR_PENALTY
 
-        # bonus for teasing (cat is still, mouse is actively moving near it)
-        if cat_speed < CAT_STATIONARY_THRESH and self.mouse_speed > MOUSE_TEASE_THRESH:
-            r += 0.3
+        # dodge bonus
+        if self.just_dodged:
+            r += DODGE_BONUS
 
-        # penalty for freezing when cat is pouncing
-        if self.cat_state == "pouncing" and self.mouse_speed < MOUSE_TEASE_THRESH:
-            r -= 0.5
+        # tease bonus (cat is still and watching, mouse is actively moving near it)
+        if self.stationary_steps >= TEASE_STATIONARY_STEPS and self.mouse_speed > MOUSE_TEASE_SPEED_THRESH:
+            r += TEASE_BONUS
+
+        # freeze during pounce penalty
+        if self.cat_state == "pouncing" and self.mouse_speed < MOUSE_TEASE_SPEED_THRESH:
+            scale = min(self.pounce_entry_stationary_steps / POUNCE_FREEZE_SCALE_DIVISOR, 1.0)
+            r -= POUNCE_FREEZE_PENALTY_BASE * (0.5 + 0.5 * scale)
+
+        # unpredictability bonus
+        if len(self.action_history) >= UNPREDICTABILITY_WINDOW:
+            recent = np.array(self.action_history)
+            action_std = np.std(recent, axis=0).mean() # mean collapses std of v and omega into single scalar
+            r += UNPREDICTABILITY_BONUS * min(action_std / UNPREDICTABILITY_STD_NORM, 1.0)
+
+        # smoothness penalty (penalize jerky acceleration)
+        if self.prev_action is not None and self.current_action is not None:
+            jerk = np.linalg.norm(self.current_action - self.prev_action) # euclidean norm (sqrt(sum of squares))
+            r -= SMOOTHNESS_PENALTY_WEIGHT * jerk
+
+        # visibility maintenance bonus
+        if dist < VISIBILITY_RANGE:
+            r += VISIBILITY_BONUS
+
+        # energy / speed cost (to prevent going max speed all the time)
+        r -= ENERGY_COST_WEIGHT * (self.mouse_speed / MAX_V)
+
+        # coverage / novelty bonus
+        if self.just_visited_new_cell:
+            r += COVERAGE_BONUS
+
+        # anti wall hugging
+        wall_closeness = self._wall_closeness()
+        if wall_closeness > 0:
+            r -= WALL_PENALTY * wall_closeness
+
+        # engagement bonus (cat is actively interested)
+        if self.cat_state in ("stalking", "pouncing"):
+            r += ENGAGEMENT_BONUS
+
+        # survival reward
+        r += SURVIVAL_REWARD
+
+        # general freeze penalty (outside of play dead)
+        if not self.playing_dead and self.mouse_speed < FREEZE_SPEED_THRESHOLD:
+            r -= FREEZE_PENALTY
 
         return float(r)
 
     def step(self, action):
         v_raw, omega_raw = float(action[0]), float(action[1])
-        v = v_raw * MAX_V
-        omega = omega_raw * MAX_OMEGA
 
-        # move mouse forward based on heading, 0.1 is the sim timestep (dt)
-        self.mouse_heading += omega * 0.1 # rotate first
-        self.mouse_x += v * np.sin(self.mouse_heading) * 0.1 # sin/cos converts heading to x/y movement
-        self.mouse_y += v * np.cos(self.mouse_heading) * 0.1
-        self.mouse_speed = abs(v)# track scalar speed for the obs and teasing reward
+        # track actions for unpredictability and smoothness
+        action_np = np.array([v_raw, omega_raw])
+        self.prev_action = self.current_action
+        self.current_action = action_np
+        self.action_history.append(action_np)
 
-        # dist before cat moves
+        # tick play dead cooldown
+        if self.play_dead_cooldown_timer > 0:
+            self.play_dead_cooldown_timer -= 1
+
+        # if playing dead, force zero movement (mimics mouse dying)
+        if self.playing_dead:
+            self.play_dead_timer -= 1
+            if self.play_dead_timer <= 0:
+                self.playing_dead = False
+                self.play_dead_cooldown_timer = PLAY_DEAD_COOLDOWN
+                self.tiredness = TIREDNESS_POST_REVIVE
+                self.effective_max_v = MAX_V * (1.0 - self.tiredness * TIREDNESS_SPEED_SCALE)
+            v = 0.0
+            omega = 0.0
+        else:
+            self._update_tiredness()
+            v = v_raw * self.effective_max_v
+            omega = omega_raw * MAX_OMEGA
+
+        # really order doesn't matter since this hapens very quickly and loops
+        # move the mouse first so the cat reacts to its actual current step position
+        self.mouse_heading += omega * SIM_DT # rotate first
+        self.mouse_x += v * np.sin(self.mouse_heading) * SIM_DT # sin / cos converts heading to x / y movement
+        self.mouse_y += v * np.cos(self.mouse_heading) * SIM_DT
+        self.mouse_speed = abs(v) # track scalar speed for the obs and teasing reward
+
+        self._update_coverage()
+
+        # dist after mouse moves but before cat moves, this is what the cat reacts to
         dx = self.cat_x - self.mouse_x
         dy = self.cat_y - self.mouse_y
-        dist = float(np.clip(np.hypot(dx, dy) / 2.0, 0.0, 1.0))
+        dist = float(np.clip(np.hypot(dx, dy) / OBS_DIST_SCALE, 0.0, 1.0))
+        self._update_cat(dist)
 
-        cat_speed = self._update_cat(dist)
-
-        # recompute dist after cat moves
+        # dist after both have moved, this is what capture / reward use
         dx = self.cat_x - self.mouse_x
         dy = self.cat_y - self.mouse_y
-        dist = float(np.clip(np.hypot(dx, dy) / 2.0, 0.0, 1.0))
+        dist_post = float(np.clip(np.hypot(dx, dy) / OBS_DIST_SCALE, 0.0, 1.0))
 
-        captured = dist < CAPTURE_DIST
+        captured = dist_post < CAPTURE_DIST
         if captured:
-            self.evasion_count = min(self.evasion_count + 1, MAX_EVASIONS)
+            self.capture_count = min(self.capture_count + 1, MAX_CAPTURE_COUNT)
+            if not self.playing_dead and self.play_dead_cooldown_timer <= 0:
+                self.playing_dead = True
+                self.play_dead_timer = PLAY_DEAD_DURATION
 
         self.step_n += 1
 
-        reward = self._reward(dist, captured, cat_speed)
-        done = (self.step_n >= 300) or (self.evasion_count >= MAX_EVASIONS and captured)
+        reward = self._reward(dist_post, captured)
+        done = (self.step_n >= MAX_EP_STEPS) or (self.capture_count >= MAX_CAPTURE_COUNT and captured)
 
         obs = self._obs()
         info = {
             "cat_state": self.cat_state,
-            "evasion_count": self.evasion_count,
-            "dist": dist,
+            "capture_count": self.capture_count,
+            "dist": dist_post,
             "captured": captured,
             "mouse_speed": self.mouse_speed,
-            "cat_speed": cat_speed,
             "close_steps": self.close_steps,
+            "tiredness": self.tiredness,
+            "playing_dead": self.playing_dead,
         }
         return obs, reward, done, info
 
 
 def _reset_window():
     """
-    fresh accumulator for the per-20-episode log window
+    fresh accumulator for the per-window episode log
     """
     return {
-        "reward_sum": 0.0, "dist_sum": 0.0, "dist_n": 0, "captures": 0,
-        "z_cap": 0, "z_danger": 0, "z_play": 0, "z_approach": 0, "z_far": 0,
-        "cs_wander": 0, "cs_stalk": 0, "cs_pounce": 0, "cs_flee": 0,
-        "c_loss": 0.0, "a_loss": 0.0, "loss_n": 0,
-        "v_sum": 0.0, "w_sum": 0.0, "act_n": 0,
+        "reward_sum": 0.0,
+        "dist_sum": 0.0,
+        "dist_count": 0,
+        "capture_count": 0,
+        "steps_in_capture_zone": 0,
+        "steps_in_danger_zone": 0,
+        "steps_in_play_zone": 0,
+        "steps_in_approach_zone": 0,
+        "steps_in_far_zone": 0,
+        "steps_cat_wandering": 0,
+        "steps_cat_stalking": 0,
+        "steps_cat_pouncing": 0,
+        "steps_cat_leaving": 0,
+        "critic_loss_sum": 0.0,
+        "actor_loss_sum": 0.0,
+        "loss_update_count": 0,
+        "linear_action_sum": 0.0,
+        "angular_action_sum": 0.0,
+        "action_count": 0,
+        "tiredness_sum": 0.0,
+        "play_dead_steps": 0,
     }
+
+
+def _accumulate_stats(window, action, reward, info):
+    """
+    update the logging window with this step's results
+    """
+    dist = info["dist"]
+    cat_state = info["cat_state"]
+
+    window["reward_sum"] += reward
+    window["dist_sum"] += dist
+    window["dist_count"] += 1
+    window["linear_action_sum"] += abs(float(action[0]))
+    window["angular_action_sum"] += abs(float(action[1]))
+    window["action_count"] += 1
+
+    if info["captured"]: window["steps_in_capture_zone"] += 1
+    elif dist < DANGER_DIST: window["steps_in_danger_zone"] += 1
+    elif dist < PLAY_DIST_HI: window["steps_in_play_zone"] += 1
+    elif dist < APPROACH_DIST: window["steps_in_approach_zone"] += 1
+    else: window["steps_in_far_zone"] += 1
+
+    if cat_state == "wandering": window["steps_cat_wandering"] += 1
+    elif cat_state == "stalking": window["steps_cat_stalking"] += 1
+    elif cat_state == "pouncing": window["steps_cat_pouncing"] += 1
+    elif cat_state == "leaving": window["steps_cat_leaving"] += 1
+
+    if info["captured"]:
+        window["capture_count"] += 1
+
+    window["tiredness_sum"] += info["tiredness"]
+    if info["playing_dead"]:
+        window["play_dead_steps"] += 1
+
+
+def _print_progress(step, ep_count, window, agent):
+    """
+    format and print the periodic training summary
+    """
+    # calculates totals to print percentages
+    dist_count_safe = max(window["dist_count"], 1)
+    zone_total = max(window["steps_in_capture_zone"] +
+                     window["steps_in_danger_zone"] +
+                     window["steps_in_play_zone"] +
+                     window["steps_in_approach_zone"] +
+                     window["steps_in_far_zone"],
+                    1)
+    cat_state_total = max(window["steps_cat_wandering"] +
+                          window["steps_cat_stalking"] +
+                          window["steps_cat_pouncing"] +
+                          window["steps_cat_leaving"],
+                        1)
+    loss_count_safe = window["loss_update_count"] or 1
+
+    print(
+        f"  step {step:6d}  ep {ep_count:4d}  "
+        f"avg_r {window['reward_sum']/LOG_WINDOW_SIZE:.2f}  "
+        f"avg_dist {window['dist_sum']/dist_count_safe:.3f}  "
+        f"captures {window['capture_count']}\n"
+        f"    zones   play={100*window['steps_in_play_zone']//zone_total:2d}%  "
+        f"approach={100*window['steps_in_approach_zone']//zone_total:2d}%  "
+        f"danger={100*window['steps_in_danger_zone']//zone_total:2d}%  "
+        f"far={100*window['steps_in_far_zone']//zone_total:2d}%  "
+        f"cap={100*window['steps_in_capture_zone']//zone_total:2d}%\n"
+        f"    cat     wander={100*window['steps_cat_wandering']//cat_state_total:2d}%  "
+        f"stalk={100*window['steps_cat_stalking']//cat_state_total:2d}%  "
+        f"pounce={100*window['steps_cat_pouncing']//cat_state_total:2d}%  "
+        f"flee={100*window['steps_cat_leaving']//cat_state_total:2d}%\n"
+        f"    losses  critic={window['critic_loss_sum']/loss_count_safe:.3f}  "
+        f"actor={window['actor_loss_sum']/loss_count_safe:.4f}  "
+        f"log_alpha={agent.log_alpha.exp().item():.4f}  "
+        f"|v|={window['linear_action_sum']/max(window['action_count'],1):.3f}  "
+        f"|w|={window['angular_action_sum']/max(window['action_count'],1):.3f}\n"
+        f"    tired   avg={window['tiredness_sum']/dist_count_safe:.3f}  "
+        f"dead_steps={window['play_dead_steps']}"
+    )
 
 
 def train():
@@ -442,87 +689,44 @@ def train():
 
     obs = env.reset()
     ep_count = 0
-    w = _reset_window()
+    window = _reset_window()
 
+    # : formats value
     print(f"training for {TOTAL_STEPS:,} steps  (learn_start={LEARN_START})\n")
 
     for step in range(TOTAL_STEPS):
-
         if step < LEARN_START:
             action = np.random.uniform(-1, 1, ACT_DIM)
         else:
             action = agent.select_action(obs, explore=True)
 
         next_obs, reward, done, info = env.step(action)
-        # divide reward by REWARD_SCALE before storing so Q-values stay small and stable
+        # divide reward by REWARD_SCALER before storing so q values stay small and stable
         # raw rewards range -2.5 to +1.5, dividing by 3.5 keeps them in -0.7 to +0.4
         # the logged reward is still raw so the numbers are easier to interpret
-        buf.push(obs, action, [reward / REWARD_SCALE], next_obs, [float(done)])
+        buf.push(obs, action, [reward / REWARD_SCALER], next_obs, [float(done)])
         obs = next_obs # roll forward to next state
 
-        d = info["dist"]
-        cs = info["cat_state"]
-
-        w["reward_sum"] += reward
-        w["dist_sum"] += d
-        w["dist_n"] += 1
-        w["v_sum"] += abs(float(action[0]))
-        w["w_sum"] += abs(float(action[1]))
-        w["act_n"] += 1
-
-        if info["captured"]: w["z_cap"] += 1
-        elif d < DANGER_DIST: w["z_danger"] += 1
-        elif d < PLAY_DIST_HI: w["z_play"] += 1
-        elif d < APPROACH_DIST: w["z_approach"] += 1
-        else: w["z_far"] += 1
-
-        if cs == "wandering": w["cs_wander"] += 1
-        elif cs == "stalking": w["cs_stalk"] += 1
-        elif cs == "pouncing": w["cs_pounce"] += 1
-        elif cs == "fleeing": w["cs_flee"] += 1
-
-        if info["captured"]:
-            w["captures"] += 1
+        _accumulate_stats(window, action, reward, info)
 
         if done:
             ep_count += 1
-            if ep_count % 20 == 0:
-                n = max(w["dist_n"], 1)
-                tz = max(w["z_cap"] + w["z_danger"] + w["z_play"] + w["z_approach"] + w["z_far"], 1)
-                tcs = max(w["cs_wander"] + w["cs_stalk"] + w["cs_pounce"] + w["cs_flee"], 1)
-                ll = w["loss_n"] or 1
-
-                print(
-                    f"  step {step:6d}  ep {ep_count:4d}  "
-                    f"avg_r {w['reward_sum']/20:.2f}  "
-                    f"avg_dist {w['dist_sum']/n:.3f}  "
-                    f"captures {w['captures']}\n"
-                    f"    zones   play={100*w['z_play']//tz:2d}%  "
-                    f"approach={100*w['z_approach']//tz:2d}%  "
-                    f"danger={100*w['z_danger']//tz:2d}%  "
-                    f"far={100*w['z_far']//tz:2d}%  "
-                    f"cap={100*w['z_cap']//tz:2d}%\n"
-                    f"    cat     wander={100*w['cs_wander']//tcs:2d}%  "
-                    f"stalk={100*w['cs_stalk']//tcs:2d}%  "
-                    f"pounce={100*w['cs_pounce']//tcs:2d}%  "
-                    f"flee={100*w['cs_flee']//tcs:2d}%\n"
-                    f"    losses  critic={w['c_loss']/ll:.3f}  actor={w['a_loss']/ll:.4f}  "
-                    f"alpha={agent.log_alpha.exp().item():.4f}  "
-                    f"|v|={w['v_sum']/max(w['act_n'],1):.3f}  "
-                    f"|w|={w['w_sum']/max(w['act_n'],1):.3f}"
-                )
-                w = _reset_window()
+            if ep_count % LOG_WINDOW_SIZE == 0:
+                _print_progress(step, ep_count, window, agent)
+                window = _reset_window()
             obs = env.reset()
 
         if len(buf) < LEARN_START:
             continue
-        losses = agent.update(buf.sample(BATCH))
-        w["c_loss"] += losses["critic_loss"]
-        w["a_loss"] += losses["actor_loss"]
-        w["loss_n"] += 1
 
-    out = os.path.join(os.path.dirname(__file__), '..', 'shared', 'mouse_policy.pt')
-    agent.save(out)
+        # updates losses after learning starts
+        losses = agent.update(buf.sample(BATCH))
+        window["critic_loss_sum"] += losses["critic_loss"]
+        window["actor_loss_sum"] += losses["actor_loss"]
+        window["loss_update_count"] += 1
+
+    out_path = os.path.join(os.path.dirname(__file__), '..', 'shared', 'mouse_policy.pt')
+    agent.save(out_path)
 
 
 if __name__ == '__main__':
