@@ -15,7 +15,6 @@ returns distance in metres
 safety layer in motors.py triggers at 0.15m (15cm)
 
 TODO: add left and right and back sensors for better obstacle avoidance
-TODO: maybe average a few readings to reduce false triggers
 """
 
 import time

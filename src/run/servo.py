@@ -2,11 +2,8 @@
 mg90s snack servo
 moves to dispense snacks
 
-usage:
-    TODO
-
-TODO: tune OPEN_DUTY once the servo is actually mounted — the right angle depends
-      on which way the horn is pointing when you screw it down
+TODO: tune OPEN_DUTY once the servo is actually mounted, 
+      the right angle depends on which way the horn is pointing when you screw it down
 """
 
 import time

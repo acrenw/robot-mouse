@@ -41,7 +41,7 @@ def load_actor(path):
     print(f"[run] loaded policy from {path}")
     return actor
 
-# deployment cat consts
+# deployment cat consts # TODO: tweak during deployment
 POUNCE_DIST = 0.10
 POUNCE_SPEED = 0.3
 STALK_DIST = 0.25

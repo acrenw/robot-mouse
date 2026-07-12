@@ -3,10 +3,7 @@ passive piezo
 sweeps frequency like a real mouse chirp instead of one constant beep
 runs in a thread so the control loop doesn't stall during a squeak
 
-usage:
-    TODO
-
-TODO: TODO
+TODO: use speaker to play actual mouse squeaks in the future instead of a piezo buzzer
 """
 
 import time, random, threading
