@@ -14,10 +14,6 @@ usage:
 
     test without a trained policy (random actions, still tests the pipeline):
     `python run/run.py --src data/videos/pounce-5.mp4 --no-policy`
-
-TODO: add speaker that plays a sound when cat is detected or gets close
-TODO: add snack servo that dispenses a treat after the robot teases the cat
-TODO: add --headless flag properly so this runs cleanly over SSH on pi
 """
 
 import sys, os, argparse, time
@@ -33,29 +29,52 @@ from motors import safety_layer, send_to_motors, stop, MAX_V, MAX_OMEGA
 from sensors import read_front_m
 from speaker import maybe_squeak
 from servo import dispense
+from train.train_config import ACTION_EMA_ALPHA, STRUGGLE_DURATION, PLAY_DEAD_DURATION
 
 POLICY_PATH = os.path.join(os.path.dirname(__file__), '..', 'shared', 'mouse_policy.pt')
 
 
 def load_actor(path):
     actor = Actor()
-    actor.load_state_dict(torch.load(path, map_location='cpu', weights_only=True))
-    actor.eval()
+    actor.load_state_dict(torch.load(path, map_location='cpu', weights_only=True))  # weights_only=True unpickles weights only and won't execute malicious code
+    actor.eval() # switch from rain -> inference mode (doesn't matter for me tho since i don't use Dropout and BatchNorm)
     print(f"[run] loaded policy from {path}")
     return actor
 
+# deployment cat consts
+POUNCE_DIST = 0.10
+POUNCE_SPEED = 0.3
+STALK_DIST = 0.25
+STALK_SPEED = 0.1
+LEAVE_DIST = 0.40
+LEAVE_SPEED_THRESH = 0.2
 
-def build_obs(cat_state, mouse_speed, sensor_front=1.0):
-    # [dist_proxy, angle, visible, vx, vy, sensor_front, mouse_speed]
-    return np.append(cat_state, [sensor_front, mouse_speed]).astype(np.float32)
+
+def estimate_cat_state_float(dist, vx, vy, visible): # nn learns that when this float is high, bad things happen
+    if not visible:
+        return 0.0
+    cat_speed = (vx**2 + vy**2) ** 0.5
+    if dist < POUNCE_DIST and cat_speed > POUNCE_SPEED: # pouncing
+        return 1.0
+    elif dist < STALK_DIST and cat_speed < STALK_SPEED: # stalking
+        return 0.25
+    elif dist > LEAVE_DIST and cat_speed > LEAVE_SPEED_THRESH: # leaving
+        return -0.5
+    return 0.0
+
+
+def build_obs(cat_state, mouse_speed, cat_state_float=0.0): # obs uses cat state, not sensor front (sensor front is only for clipping motors in safety layer now)
+    # [dist_proxy, angle, visible, vx, vy, cat_state_float, mouse_speed]
+    return np.append(cat_state, [cat_state_float, mouse_speed]).astype(np.float32)
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--src', default='0', help='video file or camera index')
-    parser.add_argument('--no-policy', action='store_true', help='run with random actions')
-    parser.add_argument('--fps', type=int, default=10, help='control loop target hz')
-    parser.add_argument('--headless', action='store_true', help='skip cv2.imshow (use over SSH)')
+    # -- makes arg an optional flag, w/o it's positional arg
+    parser.add_argument('--src', default='0', help='video file or camera index') # default 0 means camera index 0 (camera on pi or laoptop webcam)
+    parser.add_argument('--no-policy', action='store_true', help='run with random actions') # store_true makes it so that args.no_policy is True of --no-policy is present in cli
+    parser.add_argument('--fps', type=int, default=10, help='control loop target hz') # low default fps to keep YOLO inference calls/s small, lighter pi cpu load
+    parser.add_argument('--headless', action='store_true', help='skip cv2.imshow (use over SSH)') # if wanna add gui
     args = parser.parse_args()
 
     actor = None
@@ -64,9 +83,9 @@ def main():
     else:
         print("[run] no policy found, using random actions (run train/train_sac.py first)")
 
-    # use picamera2 for pi camera (cv2.VideoCapture can't talk to libcamera on pi 5)
+    # find camera to use (both still use opencv), picamera2 (not available on pc) better than cv.VideoCapture
     # fall back to cv2 for video files and laptop webcams
-    use_picam = args.src.isdigit() or args.src.startswith('/dev/video')
+    use_picam = args.src.isdigit() or args.src.startswith('/dev/video') # can be int, /dev/video.*, or video file path 
     picam = None
     cap = None
 
@@ -74,8 +93,8 @@ def main():
         try:
             from picamera2 import Picamera2
             picam = Picamera2()
-            cfg = picam.create_preview_configuration(
-                main={"size": (FRAME_W, FRAME_H), "format": "BGR888"}
+            cfg = picam.create_preview_configuration( # low latency config (unlike max quality configs like create_still_configuration or create_video_configuration)
+                main={"size": (FRAME_W, FRAME_H), "format": "BGR888"} # bgr888 matches opencv's native format, 8 bits per colour
             )
             picam.configure(cfg)
             picam.start()
@@ -86,12 +105,16 @@ def main():
 
     if not use_picam:
         src = int(args.src) if args.src.isdigit() else args.src
+        # if src is str (ie. /dev/video0) then use linux video capture api to open source, else let open cv auto select wtvr backend is most appropriate
         cap = cv2.VideoCapture(src, cv2.CAP_V4L2 if isinstance(src, str) else cv2.CAP_ANY)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_W)
+        # set capture properties
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_W) #TODO: set constants to correct w and h
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
         cap.set(cv2.CAP_PROP_FPS, args.fps)
+
         if not cap.isOpened():
-            print(f"[run] can't open source: {args.src}"); sys.exit(1)
+            print(f"[run] can't open source: {args.src}")
+            sys.exit(1)
 
     dt = 1.0 / args.fps
     prev_bbox = None
@@ -108,7 +131,9 @@ def main():
     CATCH_DIST = 0.08 # dist_proxy below this means cat is basically on top of the robot
     CATCH_TIME = 0.3 # cat has to stay that close for 0.3s to avoid false triggers from fast passes
     catch_start = None
-    treat_given = False
+    post_capture_state = None
+    post_capture_timer = 0
+    ema_action = np.zeros(2)
 
     print(f"[run] starting loop at {args.fps} hz\n")
     try:
@@ -120,8 +145,8 @@ def main():
                 frame = picam.capture_array()
             else:
                 ret, frame = cap.read()
-                if not ret:
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0) # loop video files
+                if not ret: # reached end of file
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)# sets current playback position of video capture to 0, aka restart to loop the video
                     continue
                 frame = cv2.resize(frame, (FRAME_W, FRAME_H))
 
@@ -154,19 +179,21 @@ def main():
                     stale = False
                     search_mode = True
 
-            # read front distance sensor
+            # read front distance sensor (keep last three dists and get min)
             sensor_front = read_front_m()
             sensor_buf.append(sensor_front)
             sensor_buf = sensor_buf[-3:]
             sensor_front = min(sensor_buf)
             print(f"  [sensor] {sensor_front:.2f}m")
 
-            obs = build_obs(cat_state, mouse_speed, sensor_front)
+            csf = estimate_cat_state_float(cat_state[0], cat_state[3], cat_state[4], cat_state[2] == 1.0)
+            obs = build_obs(cat_state, mouse_speed, csf)
 
             if search_mode:
                 # bypass the policy entirely and spin toward wherever the cat was last seen
                 # if cat was to the right (positive angle) we spin right (negative omega)
                 # -np.sign flips the angle direction to get the spin direction.
+                # +ive omega is ccw rotation, -ive is cw rotation
                 if last_valid_state is not None and abs(last_valid_state[1]) > 0.05:
                     search_dir = -np.sign(last_valid_state[1])  # spin toward last known side
                 else:
@@ -174,35 +201,21 @@ def main():
                 # call safety layer
                 v_safe, omega_safe = safety_layer(0.0, float(search_dir) * MAX_OMEGA * SEARCH_OMEGA_FRAC, sensor_front)
                 mouse_speed = 0.0
-                action = np.array([0.0, float(search_dir) * SEARCH_OMEGA_FRAC]) # for logging only
+                action = np.array([0.0, float(search_dir) * SEARCH_OMEGA_FRAC]) # for logging only, so not scaled to real units with MAX_OMEGA
             else:
                 if actor is not None:
-                    obs_t = torch.FloatTensor(obs).unsqueeze(0) # add batch dimension
+                    obs_t = torch.FloatTensor(obs).unsqueeze(0) # add batch dimension of 1
                     with torch.no_grad(): # no gradients needed at inference time
-                        action = actor.get_deterministic_action(obs_t).squeeze().numpy()
+                        action = actor.get_deterministic_action(obs_t).squeeze().numpy() # squeeze to get rid of batch dim
                 else:
+                    #                         low, high, size
                     action = np.random.uniform(-1, 1, 2) # random if no policy loaded
 
-                v_des = float(action[0]) * MAX_V # scale from [-1,1] to actual m/s
-                omega_des = float(action[1]) * MAX_OMEGA # scale from [-1,1] to actual rad/s
+                raw_action = np.array([float(action[0]), float(action[1])])
+                ema_action = ACTION_EMA_ALPHA * raw_action + (1.0 - ACTION_EMA_ALPHA) * ema_action
 
-                # when the cat is visible and near center, fade omega toward 0 so
-                # the robot drives straight at it instead of spinning in place
-                # the policy has a slight spin bias when centered, this corrects it
-                CENTRE_BAND = 0.15 # angles smaller than this get the fade applied
-                if cat_state[2] == 1.0 and abs(cat_state[1]) < CENTRE_BAND:
-                    fade = abs(cat_state[1]) / CENTRE_BAND # 0 at dead center, 1 at the edge of the band
-                    omega_des *= fade # smoothly reduce spin as cat approaches center
-
-                # if cat is clearly off to one side, make sure we're turning the right way
-                # the policy sometimes outputs the wrong sign for omega, this hard corrects it
-                # only applies when tracking, not when very close (dist < 0.10) because
-                # at close range we might legitimately evade in any direction
-                SIGN_THRESH = 0.30  # only correct when cat is clearly off center
-                if abs(cat_state[1]) > SIGN_THRESH and cat_state[0] > 0.10 and cat_state[2] == 1.0:
-                    correct_sign = -np.sign(cat_state[1]) # positive angle = cat right = need negative omega
-                    if np.sign(omega_des) != correct_sign:
-                        omega_des = correct_sign * abs(omega_des) # flip sign, keep magnitude
+                v_des = ((float(ema_action[0]) + 1.0) / 2.0) * MAX_V
+                omega_des = float(ema_action[1]) * MAX_OMEGA
 
                 v_safe, omega_safe = safety_layer(v_des, omega_des, sensor_front)
                 mouse_speed = abs(v_safe) # track speed for the obs next frame
@@ -211,20 +224,34 @@ def main():
 
             now_t = time.time()
 
-            if cat_state[2] == 1.0:
-                maybe_squeak(cat_state[0], cat_state[3], cat_state[4], True, now_t)
+            # post capture state machine: struggle -> dead -> revive
+            if post_capture_state == "struggling":
+                post_capture_timer -= 1
+                if post_capture_timer <= 0:
+                    post_capture_state = "dead"
+                    post_capture_timer = PLAY_DEAD_DURATION
+                    dispense()
+            elif post_capture_state == "dead":
+                post_capture_timer -= 1
+                if post_capture_timer <= 0:
+                    post_capture_state = None
 
-            # dispense treat when cat is close enough that it's basically touching the robot
-            # dist_proxy comes from bounding box size (when the cat fills the frame it drops near 0)
-            # the 0.3s debounce stops a fast close pass from triggering the treat
+            # detect new capture
             if cat_state[2] == 1.0 and cat_state[0] < CATCH_DIST:
                 if catch_start is None:
                     catch_start = now_t
-                elif now_t - catch_start >= CATCH_TIME and not treat_given:
-                    dispense()
-                    treat_given = True
+                elif now_t - catch_start >= CATCH_TIME and post_capture_state is None:
+                    post_capture_state = "struggling"
+                    post_capture_timer = STRUGGLE_DURATION
             else:
                 catch_start = None
+
+            # squeaking: panicked during struggle, silent during dead, normal otherwise
+            if cat_state[2] == 1.0:
+                if post_capture_state == "struggling":
+                    maybe_squeak(0.01, cat_state[3], cat_state[4], True, now_t)
+                elif post_capture_state != "dead":
+                    maybe_squeak(cat_state[0], cat_state[3], cat_state[4], True, now_t)
 
             mode_tag = " [search]" if search_mode else (" [stale]" if stale else "")
             print(f"  [state] d={cat_state[0]:.2f} ang={cat_state[1]:.2f} "
@@ -234,19 +261,24 @@ def main():
             if not args.headless:
                 frame = draw_debug(frame, cat_state, bbox, stale=stale)
                 action_label = f"v={v_safe:+.2f} w={omega_safe:+.2f}"
+
+                #           frame, text, bottom left test anchor coord, font, fotn scale, line thickness
                 cv2.putText(frame, action_label, (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1)
                 cv2.imshow("robomouse", frame)
-                if cv2.waitKey(1) & 0xFF == ord('q'):
+
+                if cv2.waitKey(1) & 0xFF == ord('q'): # quit with q, & is python bitwise and
                     break
 
+            # min loop rate is dt long
             elapsed = time.time() - t0
             if elapsed < dt:
                 time.sleep(dt - elapsed)
 
-    except KeyboardInterrupt:
+    except KeyboardInterrupt: # ctrl c
         pass
+
     finally:
-        stop()
+        stop() # stop motors
         if picam:
             picam.stop()
         if cap:
