@@ -2,6 +2,7 @@
 all training constants for train_sac.py
 """
 
+import numpy as np
 from shared.actor import ACT_DIM
 
 # training hyperparameters
@@ -18,8 +19,9 @@ TARGET_ENTROPY = -float(ACT_DIM)
 LOG_WINDOW_SIZE = 20
 
 # mouse physics
-MAX_V = 0.3
+MAX_V = 0.5
 MAX_OMEGA = 2.0
+ACTION_EMA_ALPHA = 0.7 # mechanical action smoothing, replaces reward based smoothness penalty (alpha=1 means no smoothing, alpha=0 means frozen bc too much smoothing)
 
 # simulation world
 SIM_DT = 0.1
@@ -27,6 +29,7 @@ WORLD_X_MIN, WORLD_X_MAX = -2.0, 2.0
 WORLD_Y_MIN, WORLD_Y_MAX = 0.0, 3.0
 OBS_DIST_SCALE = 3.6
 VISIBILITY_RANGE = 0.7
+FOV_HALF_ANGLE = np.pi / 3 # 60 each side = 120 total fov
 MAX_EP_STEPS = 300
 OUTPUT_DIM = 1
 
@@ -40,6 +43,7 @@ CAT_START_VX_RANGE = (-0.05, 0.05)
 CAT_START_VY_RANGE = (-0.01, 0.04)
 POUNCE_MISS_DIST = 0.7
 WANDER_ACCEL_NOISE = 0.01
+WANDER_CURIOSITY_BIAS = 0.15
 
 # cat leave behavior
 CLOSE_DIST = 0.20
@@ -47,6 +51,8 @@ LEAVE_ENTER_STEPS = 10
 LEAVE_SPEED = 1.2
 LEAVE_EXIT_DIST = 0.55
 LEAVE_MAX_STEPS = 40
+CAT_BORED_STEPS_THRESHOLD = 40
+HOLD_DURATION = 30
 
 # cat wobble during stalk
 WOBBLE_FREQ_HZ_RANGE = (1.5, 4.0)
@@ -62,76 +68,41 @@ PLAY_DIST_HI = 0.35
 APPROACH_DIST = 0.65
 
 # base reward values
-CAPTURE_FINAL_REWARD = 1.5
-CAPTURE_PENALTY = -2.0
-DANGER_BASE_PENALTY = -1.0
+CAPTURE_PENALTY = -3.0
+DANGER_BASE_PENALTY = -1.5
 PLAY_ZONE_REWARD = 1.0
 TOO_FAR_PENALTY = -0.5
-DODGE_BONUS = 1.0
-REWARD_SCALER = 4.0
+DODGE_BONUS = 2.0
+REWARD_SCALER = 3.0
 
 # teasing
 MOUSE_TEASE_SPEED_THRESH = 0.10
-TEASE_BONUS = 0.3
+TEASE_BONUS = 0.4
 TEASE_STATIONARY_STEPS = 5
-
-# freeze during pounce
-POUNCE_FREEZE_PENALTY_BASE = 0.5
-POUNCE_FREEZE_SCALE_DIVISOR = 20.0
 
 # capture / episode
 MAX_CAPTURE_COUNT = 5
 
-# unpredictability bonus
-# reward variance in recent actions so cat can't predict trajectory
-UNPREDICTABILITY_WINDOW = 10
-UNPREDICTABILITY_BONUS = 0.2
-UNPREDICTABILITY_STD_NORM = 0.5
-
-# smoothness penalty
-# penalize jerky acceleration changes
-SMOOTHNESS_PENALTY_WEIGHT = 0.15
-
-# visibility maintenance bonus
-# reward keeping cat in sensor range so mouse stays aware
-VISIBILITY_BONUS = 0.1
-
-# energy / speed cost
-# small tax on speed to discourage max speed all the time
-ENERGY_COST_WEIGHT = 0.05
-
-# coverage / novelty bonus
-# reward visiting new grid cells to encourage area exploration
-COVERAGE_GRID_SIZE = 0.5
-COVERAGE_BONUS = 0.15
-
 # anti wall hugging
-# penalty ramp when mouse is within WALL_MARGIN of world boundary
 WALL_MARGIN = 0.3
-WALL_PENALTY = 0.2
+WALL_PENALTY = 0.3
 
-# tiredness simulation
-# mouse gets slower over time, mimicking a real mouse getting tired
-TIREDNESS_RATE = 0.002
-TIREDNESS_RECOVERY_RATE = 0.001
-MAX_TIREDNESS = 0.8
-TIREDNESS_SPEED_SCALE = 0.6
-TIREDNESS_POST_REVIVE = 0.3
+# post capture cycle: struggle (panicked squeaking) -> dead (snack drop, silence) -> revive
+STRUGGLE_DURATION = 20 # TODO: make longer?
+STRUGGLE_SPEED_SCALE = 0.3
+STRUGGLE_ESCAPE_BONUS = 0.5
+PLAY_DEAD_DURATION = 30 # TODO: make longer?
 
-# engagement bonus
-# reward keeping cat in active states (stalking/pouncing = cat is engaged)
-ENGAGEMENT_BONUS = 0.15
-
-# play dead
-# after capture, mouse goes still (mimics dying), then revives
-PLAY_DEAD_DURATION = 30
-PLAY_DEAD_COOLDOWN = 50
+# facing bonus (encourages keeping cat in FOV, on real robot means spin to find cat)
+FACING_BONUS = 0.1
 
 # survival reward
-# small per step bonus for staying alive
-SURVIVAL_REWARD = 0.05
+SURVIVAL_REWARD = 0.01
 
-# general freeze penalty
-# penalize standing completely still (outside of play dead)
+# freeze penalty (prevents sitting still in play zone exploit)
 FREEZE_SPEED_THRESHOLD = 0.02
-FREEZE_PENALTY = 0.1
+FREEZE_PENALTY = 0.2
+
+# let cat win (time based confidence boost)
+LET_CAT_WIN_STEPS = 150 # TODO: increase? rn 150 steps * 0.1 s/step = 15s
+LET_CAT_WIN_SPEED_SCALE = 0.2

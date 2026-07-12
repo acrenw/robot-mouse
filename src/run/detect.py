@@ -1,5 +1,5 @@
 """
-cat detection using yolov8s (nano missed the cat too much) + bytetrack
+cat detection using yolov8s (nano missed the cat too much, so we're trading speed for accuracy) + bytetrack
 
 persist=True keeps bytetrack's kalman filter running between frames so it
 can predict where the cat is even when yolo misses a frame
@@ -54,19 +54,23 @@ def get_cat_state(frame, prev_bbox=None, imgsz=320):
         return _stub_state(), None
 
     model = _get_model()
+    # enabling persist allows ultralytics to track a box to the same cat from kalman filter predictions (box.id continuity) not really being used rn tho
     results = model.track(frame, classes=[CAT_CLASS], persist=True, verbose=False, imgsz=imgsz, conf=0.10)
 
+    # get most prominent cat in frame
     best = None
     best_area = 0
+    
     for r in results:
-        for box in r.boxes:
-            x1, y1, x2, y2 = box.xyxy[0].tolist()
+        for box in r.boxes: # for cat in all cats detected
+            x1, y1, x2, y2 = box.xyxy[0].tolist() # theres only one element, a (1, 4) tensor in here
             area = (x2 - x1) * (y2 - y1)
             if area > best_area:
                 best_area = area
                 best = (x1, y1, x2, y2)
 
     if best is None:
+        # no cat AKA cat is maximally far
         return np.array([1.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32), None
 
     x1, y1, x2, y2 = best
@@ -77,6 +81,7 @@ def get_cat_state(frame, prev_bbox=None, imgsz=320):
 
     # large bbox = cat is close to camera
     bbox_area_norm = (w * h) / (FRAME_W * FRAME_H)  # what fraction of the frame the cat takes up (0 to 1)
+    
     # *4 so that a cat taking up 25% of the frame reads as dist=0 (very close)
     # without *4 you'd need the cat to fill the whole frame to get dist=0, which never happens
     dist_proxy = float(np.clip(1.0 - bbox_area_norm * 4, 0.0, 1.0))
@@ -94,49 +99,64 @@ def get_cat_state(frame, prev_bbox=None, imgsz=320):
         vy = ((cy - (py1 + py2) / 2.0) / FRAME_H) * 10.0
 
     state = np.array([dist_proxy, angle, 1.0, vx, vy], dtype=np.float32)
+
     return state, (x1, y1, x2, y2)
 
 
 def _stub_state():
+    # stub so everything is neutral state
     return np.array([0.5, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
 
 
-def draw_debug(frame, cat_state, bbox, stale=False):
+def draw_debug(frame, cat_state, bbox):
     """
     draw bounding box and state overlay
     stale=True tints everything orange
     """
     if bbox is not None:
         x1, y1, x2, y2 = [int(v) for v in bbox]
-        colour = (0, 165, 255) if stale else (0, 255, 0)
+        colour = (0, 255, 0)
         cv2.rectangle(frame, (x1, y1), (x2, y2), colour, 2)
-        cv2.putText(frame, "cat" + (" [stale]" if stale else ""), (x1, y1 - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, colour, 1)
+        cv2.putText(frame, "cat", (x1, y1 - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, colour, 1)
 
     dist, angle, vis, vx, vy = cat_state
     label = f"d={dist:.2f} ang={angle:.2f} vis={vis:.0f}"
-    colour = (0, 165, 255) if stale else (255, 255, 0)
+    colour = (255, 255, 0)
+
     cv2.putText(frame, label, (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, colour, 1)
+
     return frame
 
 
 if __name__ == '__main__':
     src = sys.argv[1] if len(sys.argv) > 1 else 0
     cap = cv2.VideoCapture(src)
+
     if not cap.isOpened():
-        print(f"can't open: {src}"); sys.exit(1)
+        print(f"can't open: {src}")
+        # exit code 1 for smth went wrong
+        sys.exit(1)
+
+    print("running detection (yolov8s + bytetrack), press q to quit")
 
     prev_bbox = None
-    print("running detection (yolov8s + bytetrack), press q to quit")
+
     while True:
-        ret, frame = cap.read()
-        if not ret:
+        ret, frame = cap.read() # frame's shape: (height, width, 3), 3 is colour in B, G, R (opencv convention)
+        if not ret: # if no frame was grabbed
             break
+
         frame = cv2.resize(frame, (FRAME_W, FRAME_H))
+
         state, bbox = get_cat_state(frame, prev_bbox)
         prev_bbox = bbox
+
         frame = draw_debug(frame, state, bbox)
+
         print(f"  state: {state}")
         cv2.imshow("detect", frame)
+
+        # Q key detection
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
