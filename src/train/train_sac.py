@@ -378,8 +378,7 @@ class CatSimEnv:
         elif dist < PLAY_DIST_HI:
             r = PLAY_ZONE_REWARD
         elif dist < APPROACH_DIST:
-            t = (APPROACH_DIST - dist) / (APPROACH_DIST - PLAY_DIST_HI)
-            r = float(np.clip(t, 0.0, 1.0))
+            r = 0.2 # was smooth ramp 0->1.0, flat small reward kills approach zone parking
         else:
             r = TOO_FAR_PENALTY
 

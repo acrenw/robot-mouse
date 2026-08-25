@@ -6,7 +6,7 @@ import numpy as np
 from shared.actor import ACT_DIM
 
 # training hyperparameters
-TOTAL_STEPS = 200_000
+TOTAL_STEPS = 400_000 # was 200k, more room for exploration with higher entropy
 BUFFER_SIZE = 50_000
 BATCH = 128
 LR = 3e-4
@@ -70,7 +70,7 @@ APPROACH_DIST = 0.65
 # base reward values
 CAPTURE_PENALTY = -3.0
 DANGER_BASE_PENALTY = -1.5
-PLAY_ZONE_REWARD = 1.0
+PLAY_ZONE_REWARD = 1.5 # was 1.0, widen gap vs approach zone
 TOO_FAR_PENALTY = -0.5
 DODGE_BONUS = 2.0
 REWARD_SCALER = 3.0
