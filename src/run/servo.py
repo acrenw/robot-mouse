@@ -10,7 +10,7 @@ import time
 
 SERVO_PIN = 12
 CLOSED_DUTY = 10 # treat stays in
-OPEN_DUTY = 4 # treat drops out
+OPEN_DUTY = 7 # treat drops out
 
 _ok = False
 _pwm = None
