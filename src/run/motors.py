@@ -12,20 +12,19 @@ l9110 wiring:
     l9110 VCC -> pi 5V
     all GNDs -> common ground (pi GND + lipo GND + l9110 GND)
 
-TODO: measure actual wheelbase when chasis done and update WHEELBASE constant
 TODO: add encoder feedback for closed loop speed control if motors drift
 """
 
 import time
 
-MAX_V = 0.3 # m/s
-MAX_OMEGA = 2.0 # rad/s
+MAX_V = 0.35 # m/s
+MAX_OMEGA = 2.95 # rad/s (270 degrees = 4.712 rad, 4.712 / 2.0 / 0.8 = 2.95 rad/s)
 STOP_DIST = 0.15 # metres, safety layer hard stop
-WHEELBASE = 0.10 # metres, distance between wheels (measure and update this)
+WHEELBASE = 0.10 # metres, distance between wheels
 
-# cap pwm if lipo larger than 3-6v
-MOTOR_BATTERY_V = 3.7
-MOTOR_MAX_V = 3.7
+# cap pwm since lipo now larger than 3-6v
+MOTOR_BATTERY_V = 7.4
+MOTOR_MAX_V = 6.0
 MAX_DUTY = min(MOTOR_MAX_V / MOTOR_BATTERY_V, 1.0) * 100  # 100% now
 
 try:

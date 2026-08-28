@@ -259,7 +259,7 @@ def main():
                   f"action v_raw={action[0]:+.2f} w_raw={action[1]:+.2f}")
 
             if not args.headless:
-                frame = draw_debug(frame, cat_state, bbox, stale=stale)
+                frame = draw_debug(frame, cat_state, bbox)
                 action_label = f"v={v_safe:+.2f} w={omega_safe:+.2f}"
 
                 #           frame, text, bottom left test anchor coord, font, fotn scale, line thickness

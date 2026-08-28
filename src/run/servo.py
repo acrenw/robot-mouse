@@ -9,8 +9,8 @@ TODO: tune OPEN_DUTY once the servo is actually mounted,
 import time
 
 SERVO_PIN = 12
-CLOSED_DUTY = 7.5 # ~1.5ms pulse, neutral (treat stays in)
-OPEN_DUTY = 12.5 # ~2.5ms pulse, open (treat drops out)
+CLOSED_DUTY = 10 # treat stays in
+OPEN_DUTY = 4 # treat drops out
 
 _ok = False
 _pwm = None
